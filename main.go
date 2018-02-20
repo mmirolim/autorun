@@ -15,6 +15,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// TODO do not block on when run cmd exits, properly handler exits
 var (
 	delay           = flag.Int("delay", 1000, "delay in Milliseconds")
 	fileExt         = flag.String("ext", "go", "file extension to watch")
@@ -52,7 +53,7 @@ func startWatching(wEv chan fsnotify.Event, wE chan error, dir string, args []st
 	// run required commands for the first time
 	err := runCmds(*appName, args, appArgs, stop)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("runCmds err", err)
 	}
 	// keep track of reruns
 	rerunCounter := 1
@@ -70,13 +71,21 @@ LOOP:
 
 			log.Println("File changed:", e.Name)
 			// send signal to stop previous command
-			stop <- true
+			select {
+			case stop <- true:
+			default:
+				// if blocking it may prev process may be dead
+				go func() {
+					// drain stop ch
+					<-stop
+				}()
+			}
 			//@TODO check for better solution without sleep, had some issues with flymake emacs go plugin
 			time.Sleep(time.Duration(*delay) * time.Millisecond)
 			// run required commands
 			err := runCmds(*appName, args, appArgs, stop)
 			if err != nil {
-				log.Fatal(err)
+				fmt.Println("runCmds err", err)
 			}
 			// process started incr rerun counter
 			rerunCounter++
