@@ -150,9 +150,12 @@ func watchDir(watchEvents chan fsnotify.Event, watchErrors chan error, dir strin
 	// walk directory and if there is other directory add watcher to it
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if info.IsDir() {
-			if len(path) > 1 && strings.HasPrefix(filepath.Base(path), ".") {
-				return filepath.SkipDir
-			}
+			if len(path) > 1 {
+                               // skip hidden and vendor dirs
+                               if strings.HasPrefix(filepath.Base(path), ".") || strings.HasPrefix(path, "vendor") {
+                                       return filepath.SkipDir
+                               }
+                        }
 			// create new watcher
 			watcher, err := fsnotify.NewWatcher()
 			if err != nil {
