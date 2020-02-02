@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -15,14 +16,16 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// TODO do not block on when run cmd exits, properly handler exits
 var (
 	delay           = flag.Int("delay", 1000, "delay in Milliseconds")
-	fileExt         = flag.String("ext", "go", "file extension to watch")
-	showDebug       = flag.Bool("debug", false, "show debug information")
-	appName         = flag.String("name", "goapp", "name builded binary")
-	appArgs         = flag.String("args", "", "arguments to pass to binary format -k1=v1 -k2=v2")
-	excludePrefixes = flag.String("exclude", "flymake,#flymake", "prefixes to exclude sep by comma")
+	appArgs         = flag.String("args", "", "arguments to pass to binary format '-k1 v1 -k2v2'")
+	excludePrefixes = flag.String("exclude", ".,#,flymake,#flymake", "prefixes to exclude sep by comma")
+
+	excludeDirs = flag.String("exclude-dirs", "vendor,node_modules", "exclude directories from watching")
+
+	delayDuration           time.Duration
+	excludeFilePrefixesList []string
+	excludeDirsList         []string
 )
 
 func init() {
@@ -31,166 +34,138 @@ func init() {
 
 func main() {
 	fmt.Println("autorun running...")
-	watchEvents := make(chan fsnotify.Event)
-	watchErrors := make(chan error)
-	watchDir(watchEvents, watchErrors, ".")
-	// set command and args
-	// default application name set as goapp
-	args := strings.Split("go build -o "+*appName, " ")
-	done := make(chan bool)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Printf("%+v\n", err) // output for debug
+		os.Exit(1)
+	}
+	defer watcher.Close()
 
-	// start listening to notifications in separate goroutine
-	go startWatching(watchEvents, watchErrors, ".", args, *appArgs)
+	excludeFilePrefixesList = strings.Split(*excludePrefixes, ",")
+	excludeDirsList = strings.Split(*excludeDirs, ",")
 
-	// block
-	<-done
+	delayDuration = time.Duration(*delay) * time.Millisecond
+
+	watchDir(watcher, ".")
+	// start listening
+	startWatching(watcher, strings.Split(*appArgs, " "))
 }
 
 // main loop to listen all events from all registered directories
 // and exec required commands, kill previously started process, build new and start it
-func startWatching(wEv chan fsnotify.Event, wE chan error, dir string, args []string, appArgs string) {
-	stop := make(chan bool)
-	// run required commands for the first time
-	err := runCmds(*appName, args, appArgs, stop)
-	if err != nil {
-		fmt.Println("runCmds err", err)
-	}
-	// keep track of reruns
-	rerunCounter := 1
+func startWatching(watcher *fsnotify.Watcher, args []string) {
+	var (
+		lastModFile string
+		lastModTime time.Time
+		ctx         context.Context
+		cancel      context.CancelFunc
+	)
+
 LOOP:
 	for {
 		select {
-		case e := <-wEv:
-			for _, excludePrefix := range strings.Split(*excludePrefixes, ",") {
-				name := path.Base(e.Name)
-				// filter all files except .go not test files
-				if e.Op&fsnotify.Write != fsnotify.Write || !strings.HasSuffix(name, "."+*fileExt) || strings.HasPrefix(name, excludePrefix) || strings.HasSuffix(name, "_test.go") {
-					continue LOOP
-				}
+		case e := <-watcher.Events:
+			if skipChange(e, lastModFile, lastModTime) {
+				continue LOOP
 			}
-
 			log.Println("File changed:", e.Name)
-			// send signal to stop previous command
-			select {
-			case stop <- true:
-			default:
-				// if blocking it may prev process may be dead
-				go func() {
-					// drain stop ch
-					<-stop
-				}()
-			}
-			//@TODO check for better solution without sleep, had some issues with flymake emacs go plugin
-			time.Sleep(time.Duration(*delay) * time.Millisecond)
-			// run required commands
-			err := runCmds(*appName, args, appArgs, stop)
-			if err != nil {
-				fmt.Println("runCmds err", err)
-			}
-			// process started incr rerun counter
-			rerunCounter++
 
-			// add loging
-			debug("command executed")
+			lastModFile = e.Name
+			lastModTime = time.Now()
+			if cancel != nil {
+				cancel()
+			}
+			ctx, cancel = context.WithCancel(context.Background())
+			// do not block loop
+			go runCmds(ctx, args)
 
-		case err := <-wE:
+		case err := <-watcher.Errors:
 			log.Println("Error:", err)
 		}
 	}
 }
 
 // cmd sequence to run build with some name, check err and run named binary
-func runCmds(app string, bin []string, appArgs string, stop chan bool) error {
-	// execute command
-	debug("arguments for CMD", bin)
-	err := newCmd(bin[0], bin[1:]).Run()
-	if err != nil {
-		return err
-	}
-	// run binary
-	// do not wait process to finish
-	// in case of console blocking programs
-	// split binary commands by space
-	cmd := newCmd("./"+app, strings.Split(appArgs, " "))
-	err = cmd.Start()
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		<-stop
-		// kill process if already running
-		// try to kill process
-		debug("process to kill pid", cmd.Process.Pid)
-		err := cmd.Process.Kill()
-		if err != nil {
-			fmt.Println("cmd process kill returned error" + err.Error())
-		}
-		err = cmd.Wait()
-		if err != nil {
-			fmt.Println("cmd process wait returned error" + err.Error())
-		}
-	}()
-
-	return nil
-}
-
-// create new cmd in standard way
-func newCmd(bin string, args []string) *exec.Cmd {
-	cmd := exec.Command(bin, args...)
+func runCmds(ctx context.Context, args []string) error {
+	// build binary
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", "goapp")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	return cmd
+	err := cmd.Run()
+	if err != nil {
+		fmt.Printf("go build error %+v\n", err) // output for debug
+		return err
+	}
+
+	// run binary
+	cmd = exec.CommandContext(ctx, "./goapp", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	err = cmd.Start()
+	if err != nil {
+		fmt.Printf("./goapp error %+v\n", err) // output for debug
+		return err
+	}
+
+	return cmd.Wait()
 }
 
 // recursively set watcher to all child directories
 // and fan-in all events and errors to chan in main loop
-func watchDir(watchEvents chan fsnotify.Event, watchErrors chan error, dir string) {
+func watchDir(watcher *fsnotify.Watcher, dir string) error {
 	// walk directory and if there is other directory add watcher to it
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			if len(path) > 1 {
-                               // skip hidden and vendor dirs
-                               if strings.HasPrefix(filepath.Base(path), ".") || strings.HasPrefix(path, "vendor") {
-                                       return filepath.SkipDir
-                               }
-                        }
-			// create new watcher
-			watcher, err := fsnotify.NewWatcher()
-			if err != nil {
-				log.Fatal(err)
-			}
-			// add watcher to dir
-			err = watcher.Add(path)
-			if err != nil {
-				errClose := watcher.Close()
-				log.Fatal(errClose, err)
-			}
-			debug("dir to watch", path)
-			go func() {
-				for {
-					select {
-					case v := <-watcher.Events:
-						// on event send data to shared event chan
-						watchEvents <- v
-					case err := <-watcher.Errors:
-						// on error send data to shared error chan
-						watchErrors <- err
-					}
-				}
-			}()
+		if !info.IsDir() {
+			return err
 		}
-		return err
+		if skipDir(path) {
+			return filepath.SkipDir
+		}
+		err = watcher.Add(path)
+		if err != nil {
+			return err
+		}
+		return nil
 	})
-	if err != nil {
-		fmt.Println("filepath walk err " + err.Error())
-	}
+	return err
 }
 
-func debug(args ...interface{}) {
-	// check flag for log level
-	if *showDebug {
-		log.Println(args...)
+func skipChange(e fsnotify.Event, lastModFile string, lastModTime time.Time) bool {
+	if e.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+		return true
 	}
+	if lastModFile == e.Name {
+		if time.Since(lastModTime) <= delayDuration {
+			return true
+		}
+	}
+	if !strings.HasSuffix(e.Name, ".go") {
+		return true
+	}
+	name := path.Base(e.Name)
+	for _, prefix := range excludeFilePrefixesList {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func skipDir(path string) bool {
+	if path == "." {
+		return false
+	}
+	baseDir := filepath.Base(path)
+	// skip hidden dirs
+	if strings.HasPrefix(baseDir, ".") {
+		return true
+	}
+	for _, name := range excludeDirsList {
+		if baseDir == name {
+			return true
+		}
+	}
+	return false
 }
